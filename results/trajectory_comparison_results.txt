@@ -1,0 +1,50 @@
+纯轨迹数据架构对比结果
+============================================================
+
+1. 性能排名（按验证集准确率）:
+1. Random Forest (Raw Data (Flattened)): Val=1.0000, Test=1.0000
+2. SVM (Raw Data (Flattened)): Val=1.0000, Test=1.0000
+3. Logistic Regression (Raw Data (Flattened)): Val=1.0000, Test=1.0000
+4. Gradient Boosting (Raw Data (Flattened)): Val=1.0000, Test=1.0000
+5. Neural Network (Raw Data (Flattened)): Val=1.0000, Test=1.0000
+6. Random Forest (Basic Features): Val=1.0000, Test=1.0000
+7. SVM (Basic Features): Val=1.0000, Test=1.0000
+8. Logistic Regression (Basic Features): Val=1.0000, Test=1.0000
+9. Gradient Boosting (Basic Features): Val=1.0000, Test=1.0000
+10. Random Forest (PCA Reduced): Val=1.0000, Test=1.0000
+11. SVM (PCA Reduced): Val=1.0000, Test=1.0000
+12. Logistic Regression (PCA Reduced): Val=1.0000, Test=1.0000
+13. Gradient Boosting (PCA Reduced): Val=1.0000, Test=1.0000
+14. Neural Network (PCA Reduced): Val=1.0000, Test=1.0000
+15. Neural Network (Basic Features): Val=0.9944, Test=1.0000
+
+2. 最佳模型: Random Forest (Raw Data (Flattened))
+   验证准确率: 1.0000
+   测试准确率: 1.0000
+
+3. 方法对比分析:
+   Raw Data (Flattened):
+     平均验证准确率: 1.0000
+     平均测试准确率: 1.0000
+     最高验证准确率: 1.0000
+     性能标准差: 0.0000
+   Basic Features:
+     平均验证准确率: 0.9989
+     平均测试准确率: 1.0000
+     最高验证准确率: 1.0000
+     性能标准差: 0.0022
+   PCA Reduced:
+     平均验证准确率: 1.0000
+     平均测试准确率: 1.0000
+     最高验证准确率: 1.0000
+     性能标准差: 0.0000
+
+4. 特征维度分析:
+   原始数据维度: 600 (展平后的3D坐标)
+   基础特征维度: 19 (提取的统计特征)
+   PCA降维维度: 50 (主成分分析)
+
+5. 结论:
+   最佳方法: Raw Data (Flattened)
+   最佳模型: Random Forest
+   最佳性能: 1.0000

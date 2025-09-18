@@ -1,0 +1,81 @@
+最终分类报告
+============================================================
+
+Random Forest (Raw Data):
+              precision    recall  f1-score   support
+
+      Normal       1.00      1.00      1.00        60
+    Patient1       1.00      1.00      1.00        60
+    Patient2       1.00      1.00      1.00        60
+
+    accuracy                           1.00       180
+   macro avg       1.00      1.00      1.00       180
+weighted avg       1.00      1.00      1.00       180
+
+------------------------------------------------------------
+
+SVM (Raw Data):
+              precision    recall  f1-score   support
+
+      Normal       1.00      1.00      1.00        60
+    Patient1       1.00      1.00      1.00        60
+    Patient2       1.00      1.00      1.00        60
+
+    accuracy                           1.00       180
+   macro avg       1.00      1.00      1.00       180
+weighted avg       1.00      1.00      1.00       180
+
+------------------------------------------------------------
+
+Logistic Regression (Raw Data):
+              precision    recall  f1-score   support
+
+      Normal       1.00      1.00      1.00        60
+    Patient1       1.00      1.00      1.00        60
+    Patient2       1.00      1.00      1.00        60
+
+    accuracy                           1.00       180
+   macro avg       1.00      1.00      1.00       180
+weighted avg       1.00      1.00      1.00       180
+
+------------------------------------------------------------
+
+Random Forest (3D Features):
+              precision    recall  f1-score   support
+
+      Normal       1.00      1.00      1.00        60
+    Patient1       1.00      1.00      1.00        60
+    Patient2       1.00      1.00      1.00        60
+
+    accuracy                           1.00       180
+   macro avg       1.00      1.00      1.00       180
+weighted avg       1.00      1.00      1.00       180
+
+------------------------------------------------------------
+
+SVM (3D Features):
+              precision    recall  f1-score   support
+
+      Normal       1.00      1.00      1.00        60
+    Patient1       1.00      1.00      1.00        60
+    Patient2       1.00      1.00      1.00        60
+
+    accuracy                           1.00       180
+   macro avg       1.00      1.00      1.00       180
+weighted avg       1.00      1.00      1.00       180
+
+------------------------------------------------------------
+
+Logistic Regression (3D Features):
+              precision    recall  f1-score   support
+
+      Normal       1.00      1.00      1.00        60
+    Patient1       1.00      1.00      1.00        60
+    Patient2       1.00      1.00      1.00        60
+
+    accuracy                           1.00       180
+   macro avg       1.00      1.00      1.00       180
+weighted avg       1.00      1.00      1.00       180
+
+------------------------------------------------------------
+
