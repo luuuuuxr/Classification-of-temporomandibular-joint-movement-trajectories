@@ -33,6 +33,8 @@ from sklearn.tree import DecisionTreeClassifier
 from model_explainability import plot_phase_shap_importance, plot_phase_aggregated_feature_importance
 from improved_explainability import comprehensive_phase_analysis
 from trajectory_build import split_into_phases, plot_phases_3d
+from advanced_attention import AdvancedAttentionMechanisms
+from enhanced_lstm_model import EnhancedLSTMFeatureExtractor, create_enhanced_lstm_model
 
 # 设置全局随机种子
 tf.random.set_seed(42)
@@ -782,16 +784,36 @@ def residual_block(x, units=64, dropout_rate=0.25, l2_reg=0.001):
 def build_lstm_feature_model_final(input_shape,
                                    lstm_units=64,
                                    dense_units=32,
-                                   use_attention=True):
+                                   use_attention=True,
+                                   use_advanced_attention=False):
     inputs = Input(shape=input_shape)
 
-    x = Conv1D(64, 3, padding='same', activation='relu')(inputs)
-    x = MaxPooling1D(pool_size=2)(x)
+    x = LSTM(lstm_units, return_sequences=True,
+             kernel_regularizer=l2(0.0001))(inputs)
+    x = BatchNormalization()(x)
 
-    x = residual_block(x, lstm_units * 2)
-    x = residual_block(x, lstm_units)
+    x = residual_block(x, lstm_units * 2, 0.1, 0.001)
+    x = residual_block(x, lstm_units, 0.2, 0.001)
 
-    if use_attention:
+    if use_advanced_attention:
+        # 使用增强注意力机制
+        attention_mechanisms = AdvancedAttentionMechanisms()
+        
+        # 多尺度注意力
+        x = attention_mechanisms.multi_scale_attention(x, scales=[1, 2, 4])
+        
+        # 时间注意力
+        x, time_weights = attention_mechanisms.temporal_attention_layer(x)
+        
+        # 空间注意力
+        x, spatial_weights = attention_mechanisms.spatial_attention_layer(x)
+        
+        # 自注意力
+        x = attention_mechanisms.self_attention_layer(
+            x, num_heads=8, key_dim=lstm_units // 8
+        )
+    elif use_attention:
+        # 原始简单注意力
         attn = Attention()([x, x])
         x = Concatenate()([x, attn])
 
@@ -807,6 +829,7 @@ def extract_lstm_features(X_train, y_train, X_val, y_val, X_test,
                           save_path="best_model.h5",
                           dense_units=32,
                           use_attention=True,
+                          use_advanced_attention=False,  # 新增参数
                           loss_type='sparse_categorical_crossentropy',
                           return_scaler=False):
     if input_shape is None:
@@ -816,7 +839,8 @@ def extract_lstm_features(X_train, y_train, X_val, y_val, X_test,
         input_shape=input_shape,
         lstm_units=64,
         dense_units=dense_units,
-        use_attention=use_attention
+        use_attention=use_attention,
+        use_advanced_attention=use_advanced_attention  # 传递参数
     )
 
     model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=1e-3),
@@ -1260,6 +1284,10 @@ def visualize_tsne(original_data, lstm_data, labels, titles):
 
 
 def main():
+    # ============ 配置选项 ============
+    # 是否使用增强LSTM特征提取 (True: 使用增强LSTM, False: 使用原始LSTM)
+    USE_ENHANCED_LSTM = False
+    
     # ============ 读取数据并初步处理数据 ============
     loader = TrajectoryDataLoader(target_length=200, threshold=1.0)
 
@@ -1318,14 +1346,45 @@ def main():
     X_train = scaler.fit_transform(X_train.reshape(X_train.shape[0], -1)).reshape(X_train.shape)
     X_val = scaler.transform(X_val.reshape(X_val.shape[0], -1)).reshape(X_val.shape)
     X_test_scaler = scaler.transform(X_test.reshape(X_test.shape[0], -1)).reshape(X_test.shape)
-    X_train_features, X_test_features = extract_lstm_features(X_train, y_train, X_val, y_val, X_test_scaler,
-                                                              input_shape=None,
-                                                              save_path="best_model.h5",
-                                                              dense_units=32,  # ✅ 输出维度
-                                                              use_attention=True,  # ✅ 是否使用 Attention
-                                                              loss_type='mse',  # ✅ 损失函数类型
-                                                              return_scaler=False  # ✅ 是否返回 scaler
-                                                              )
+    # ============ 特征提取 ============
+    if USE_ENHANCED_LSTM:
+        print("🚀 使用增强LSTM进行特征提取...")
+        # 使用增强LSTM特征提取
+        extractor = EnhancedLSTMFeatureExtractor(
+            lstm_units=[128, 64],
+            attention_heads=16,
+            dense_units=128,
+            dropout_rate=0.5
+        )
+        
+        # 训练特征提取器
+        print("�� 训练增强LSTM特征提取器...")
+        history = extractor.train_feature_extractor(
+            X_train, y_train, X_val, y_val,
+            epochs=100,
+            batch_size=64,
+            save_path="enhanced_lstm_model.h5"
+        )
+        
+        # 提取特征
+        print("🔍 提取训练集和测试集特征...")
+        X_train_features, X_test_features = extractor.extract_features_with_scaling(X_train, X_test)
+        
+        print(f"✅ 增强LSTM特征提取完成!")
+        print(f"训练集特征形状: {X_train_features.shape}")
+        print(f"测试集特征形状: {X_test_features.shape}")
+    else:
+        print("🔍 使用原始LSTM进行特征提取...")
+        X_train_features, X_test_features = extract_lstm_features(X_train, y_train, X_val, y_val, X_test_scaler,
+                                                                  input_shape=None,
+                                                                  save_path="best_model.h5",
+                                                                  dense_units=32,  # ✅ 输出维度
+                                                                  use_attention=True,  # ✅ 是否使用 Attention
+                                                                  loss_type="mse",  # ✅ 损失函数类型
+                                                                  return_scaler=False,  # ✅ 是否返回 scaler
+                                                                  use_advanced_attention=True  # ✅ 启用增强注意力机制
+                                                                  )
+    
 
     print("训练集在经过LSTM提取时序信息后大小：")
     print(X_train_features.shape)
