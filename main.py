@@ -7,6 +7,7 @@ import numpy as np
 import pandas as pd
 import seaborn as sns
 import tensorflow as tf
+import torch
 from fastdtw import fastdtw
 from hyperopt import fmin, tpe, hp, Trials, STATUS_OK
 from imblearn.over_sampling import SMOTE
@@ -29,12 +30,270 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.preprocessing import label_binarize
 from sklearn.svm import SVC
 from sklearn.tree import DecisionTreeClassifier
+from src.models.advanced_classifiers import test_advanced_classifiers, AdvancedClassifierTrainer
 
-from model_explainability import plot_phase_shap_importance, plot_phase_aggregated_feature_importance
-from trajectory_build import split_into_phases, plot_phases_3d
+# 新增四种先进分类器的导入
+try:
+    import lightgbm as lgb
+
+    LIGHTGBM_AVAILABLE = True
+except ImportError:
+    LIGHTGBM_AVAILABLE = False
+
+try:
+    import catboost as cb
+
+    CATBOOST_AVAILABLE = True
+except ImportError:
+    CATBOOST_AVAILABLE = False
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from sklearn.neighbors import NearestNeighbors
+
+from src.visualization.model_explainability import plot_phase_shap_importance, plot_phase_aggregated_feature_importance
+from src.visualization.improved_explainability import comprehensive_phase_analysis
+from src.utils.trajectory_build import split_into_phases, plot_phases_3d
+from src.models.advanced_attention import AdvancedAttentionMechanisms
+from src.models.enhanced_lstm_model import EnhancedLSTMFeatureExtractor, create_enhanced_lstm_model
 
 # 设置全局随机种子
 tf.random.set_seed(42)
+
+
+# ========== 四种新增先进分类器实现 ==========
+
+class LightGBMClassifier:
+    def __init__(self):
+        self.model = None
+        self.scaler = StandardScaler()
+        
+    def fit(self, X, y):
+        if not LIGHTGBM_AVAILABLE:
+            raise ImportError('LightGBM not available')
+        X_scaled = self.scaler.fit_transform(X)
+        train_data = lgb.Dataset(X_scaled, label=y)
+        params = {
+            'objective': 'multiclass',
+            'num_class': len(np.unique(y)),
+            'metric': 'multi_logloss',
+            'boosting_type': 'gbdt',
+            'num_leaves': 31,
+            'learning_rate': 0.05,
+            'feature_fraction': 0.9,
+            'bagging_fraction': 0.8,
+            'bagging_freq': 5,
+            'verbose': -1
+        }
+        self.model = lgb.train(params, train_data, 100)
+        return self
+        
+    def predict(self, X):
+        X_scaled = self.scaler.transform(X)
+        pred_proba = self.model.predict(X_scaled, num_iteration=self.model.best_iteration)
+        return np.argmax(pred_proba, axis=1)
+        
+    def predict_proba(self, X):
+        X_scaled = self.scaler.transform(X)
+        return self.model.predict(X_scaled, num_iteration=self.model.best_iteration)
+
+
+class CatBoostClassifier:
+    def __init__(self):
+        self.model = None
+        self.scaler = StandardScaler()
+        
+    def fit(self, X, y):
+        if not CATBOOST_AVAILABLE:
+            raise ImportError('CatBoost not available')
+        X_scaled = self.scaler.fit_transform(X)
+        self.model = cb.CatBoostClassifier(
+            iterations=100,
+            learning_rate=0.1,
+            depth=6,
+            loss_function='MultiClass',
+            random_seed=42
+        )
+        self.model.fit(X_scaled, y)
+        return self
+        
+    def predict(self, X):
+        X_scaled = self.scaler.transform(X)
+        predictions = self.model.predict(X_scaled)
+        # CatBoost 返回二维数组，需要压缩为一维
+        return predictions.flatten() if predictions.ndim > 1 else predictions
+        
+    def predict_proba(self, X):
+        X_scaled = self.scaler.transform(X)
+        return self.model.predict_proba(X_scaled)
+
+
+class PrototypicalNetwork:
+    def __init__(self, input_dim, hidden_dim=256, output_dim=128):
+        self.input_dim = input_dim
+        self.hidden_dim = hidden_dim
+        self.output_dim = output_dim
+        self.model = None
+        self.prototypes = None
+        self.scaler = StandardScaler()
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        
+    def _build_encoder(self):
+        return nn.Sequential(
+            nn.Linear(self.input_dim, self.hidden_dim),
+            nn.BatchNorm1d(self.hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(self.hidden_dim, self.hidden_dim),
+            nn.BatchNorm1d(self.hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(self.hidden_dim, self.hidden_dim // 2),
+            nn.BatchNorm1d(self.hidden_dim // 2),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(self.hidden_dim // 2, self.output_dim)
+        )
+        
+    def _compute_prototypes(self, embeddings, labels):
+        unique_labels = torch.unique(labels)
+        prototypes = []
+        for label in unique_labels:
+            mask = labels == label
+            if mask.sum() > 0:
+                prototype = embeddings[mask].mean(dim=0)
+                prototypes.append(prototype)
+        return torch.stack(prototypes) if prototypes else torch.empty(0, embeddings.size(1))
+    
+    def _prototypical_loss(self, embeddings, labels, prototypes):
+        if len(prototypes) == 0:
+            return torch.tensor(0.0, device=embeddings.device, requires_grad=True)
+        
+        distances = torch.cdist(embeddings, prototypes)
+        logits = -distances
+        return F.cross_entropy(logits, labels)
+        
+    def fit(self, X, y, epochs=200, batch_size=32, lr=0.001, patience=20):
+        X_scaled = self.scaler.fit_transform(X)
+        self.model = self._build_encoder().to(self.device)
+        
+        from sklearn.model_selection import train_test_split
+        X_train, X_val, y_train, y_val = train_test_split(
+            X_scaled, y, test_size=0.2, random_state=42, stratify=y
+        )
+        
+        X_train_tensor = torch.FloatTensor(X_train).to(self.device)
+        y_train_tensor = torch.LongTensor(y_train).to(self.device)
+        X_val_tensor = torch.FloatTensor(X_val).to(self.device)
+        y_val_tensor = torch.LongTensor(y_val).to(self.device)
+        
+        optimizer = torch.optim.Adam(self.model.parameters(), lr=lr, weight_decay=1e-4)
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode='min', factor=0.5, patience=10, 
+        )
+        
+        best_loss = float('inf')
+        patience_counter = 0
+        best_model_state = None
+        
+        self.model.train()
+        for epoch in range(epochs):
+            total_loss = 0
+            num_batches = 0
+            
+            for i in range(0, len(X_train_tensor), batch_size):
+                batch_end = min(i + batch_size, len(X_train_tensor))
+                batch_x = X_train_tensor[i:batch_end]
+                batch_y = y_train_tensor[i:batch_end]
+                
+                optimizer.zero_grad()
+                embeddings = self.model(batch_x)
+                prototypes = self._compute_prototypes(embeddings, batch_y)
+                loss = self._prototypical_loss(embeddings, batch_y, prototypes)
+                
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                optimizer.step()
+                
+                total_loss += loss.item()
+                num_batches += 1
+            
+            self.model.eval()
+            with torch.no_grad():
+                val_embeddings = self.model(X_val_tensor)
+                val_prototypes = self._compute_prototypes(val_embeddings, y_val_tensor)
+                val_loss = self._prototypical_loss(val_embeddings, y_val_tensor, val_prototypes)
+            self.model.train()
+            
+            avg_train_loss = total_loss / num_batches
+            scheduler.step(val_loss)
+            
+            if val_loss < best_loss:
+                best_loss = val_loss
+                patience_counter = 0
+                best_model_state = self.model.state_dict().copy()
+            else:
+                patience_counter += 1
+            
+            if epoch % 50 == 0:
+                print(f'Epoch {epoch}, Train Loss: {avg_train_loss:.4f}, Val Loss: {val_loss:.4f}')
+            
+            if patience_counter >= patience:
+                print(f'Early stopping at epoch {epoch}')
+                break
+        
+        if best_model_state is not None:
+            self.model.load_state_dict(best_model_state)
+        
+        self.model.eval()
+        with torch.no_grad():
+            all_embeddings = self.model(torch.FloatTensor(X_scaled).to(self.device))
+            all_labels = torch.LongTensor(y).to(self.device)
+            self.prototypes = self._compute_prototypes(all_embeddings, all_labels)
+        
+        return self
+        
+    def predict(self, X):
+        X_scaled = self.scaler.transform(X)
+        X_tensor = torch.FloatTensor(X_scaled).to(self.device)
+        
+        self.model.eval()
+        with torch.no_grad():
+            embeddings = self.model(X_tensor)
+            if len(self.prototypes) > 0:
+                distances = torch.cdist(embeddings, self.prototypes)
+                predictions = torch.argmin(distances, dim=1)
+            else:
+                predictions = torch.randint(0, 3, (len(X),), device=self.device)
+        
+        return predictions.cpu().numpy()
+    
+    def predict_proba(self, X):
+        X_scaled = self.scaler.transform(X)
+        X_tensor = torch.FloatTensor(X_scaled).to(self.device)
+        
+        self.model.eval()
+        with torch.no_grad():
+            embeddings = self.model(X_tensor)
+            if len(self.prototypes) > 0:
+                distances = torch.cdist(embeddings, self.prototypes)
+                # 将距离转换为概率（使用softmax）
+                logits = -distances  # 负距离作为logits
+                probabilities = torch.softmax(logits, dim=1)
+            else:
+                # 如果没有原型，返回均匀分布
+                probabilities = torch.ones(len(X), 3, device=self.device) / 3
+        
+        return probabilities.cpu().numpy()
+        
+    def set_training_data(self, X, y):
+        self.X_train = X
+        self.y_train = y
+
+# ========== 新分类器实现结束 ==========
+
+# ========== 新分类器实现结束 ==========
 
 
 class TrajectoryDataLoader:
@@ -716,7 +975,7 @@ def augment_data_pipeline(X_train, y_train, augmenter, target_counts, scaler=Non
 
     '''plot_2d_trajectory(X_augmented_only, y_augmented_only, aug_file_info, base_save_path="Augmented_2D_Trajectories")
     plot_3d_trajectory(X_augmented_only, y_augmented_only, aug_file_info, base_save_path="Augmented_3D_Trajectories")
-    print("\n🎨 增强轨迹已保存至“Augmented_2D_Trajectories”和“Augmented_3D_Trajectories“！...")'''
+    print("\n🎨 增强轨迹已保存至"Augmented_2D_Trajectories"和"Augmented_3D_Trajectories"！...")'''
 
     # 可视化若干对增强轨迹
     '''print("\n🎨 正在展示原始轨迹与增强轨迹对比示例...")
@@ -781,24 +1040,51 @@ def residual_block(x, units=64, dropout_rate=0.25, l2_reg=0.001):
 def build_lstm_feature_model_final(input_shape,
                                    lstm_units=64,
                                    dense_units=32,
-                                   use_attention=True):
+                                   use_attention=True,
+                                   use_advanced_attention=False):
     inputs = Input(shape=input_shape)
 
-    x = Conv1D(64, 3, padding='same', activation='relu')(inputs)
-    x = MaxPooling1D(pool_size=2)(x)
+    x = LSTM(lstm_units, return_sequences=True,
+             kernel_regularizer=l2(0.0001))(inputs)
+    x = BatchNormalization()(x)
 
-    x = residual_block(x, lstm_units * 2)
-    x = residual_block(x, lstm_units)
+    x = residual_block(x, lstm_units * 2, 0.1, 0.001)
+    x = residual_block(x, lstm_units, 0.2, 0.001)
 
-    if use_attention:
+    if use_advanced_attention:
+        # 使用增强注意力机制
+        attention_mechanisms = AdvancedAttentionMechanisms()
+        
+        # 多尺度注意力
+        x = attention_mechanisms.multi_scale_attention(x, scales=[1, 2, 4])
+        
+        # 时间注意力
+        x, time_weights = attention_mechanisms.temporal_attention_layer(x)
+        
+        # 空间注意力
+        x, spatial_weights = attention_mechanisms.spatial_attention_layer(x)
+        
+        # 自注意力
+        x = attention_mechanisms.self_attention_layer(
+            x, num_heads=8, key_dim=lstm_units // 8
+        )
+    elif use_attention:
+        # 原始简单注意力
         attn = Attention()([x, x])
         x = Concatenate()([x, attn])
 
     x = GlobalAveragePooling1D()(x)
     x = Dense(dense_units, activation='relu', kernel_regularizer=l2(0.01))(x)
-
-    model = Model(inputs, x)
-    return model
+    
+    # 添加分类输出层
+    num_classes = 3  # 假设有3个类别
+    classification_output = Dense(num_classes, activation='softmax', name='classification')(x)
+    
+    # 创建两个模型：一个用于训练（包含分类输出），一个用于特征提取
+    model = Model(inputs, classification_output)
+    feature_model = Model(inputs, x)  # 只输出特征
+    
+    return model, feature_model
 
 
 def extract_lstm_features(X_train, y_train, X_val, y_val, X_test,
@@ -806,16 +1092,19 @@ def extract_lstm_features(X_train, y_train, X_val, y_val, X_test,
                           save_path="best_model.h5",
                           dense_units=32,
                           use_attention=True,
+                          use_advanced_attention=False,  # 新增参数
                           loss_type='sparse_categorical_crossentropy',
                           return_scaler=False):
     if input_shape is None:
         input_shape = X_train.shape[1:]
 
-    model = build_lstm_feature_model_final(
+    # 获取训练和特征提取模型
+    model, feature_model = build_lstm_feature_model_final(
         input_shape=input_shape,
         lstm_units=64,
         dense_units=dense_units,
-        use_attention=use_attention
+        use_attention=use_attention,
+        use_advanced_attention=use_advanced_attention  # 传递参数
     )
 
     model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=1e-3),
@@ -836,9 +1125,7 @@ def extract_lstm_features(X_train, y_train, X_val, y_val, X_test,
         verbose=2
     )
 
-    # 特征提取器（输出最后 Dense）
-    feature_model = Model(inputs=model.input, outputs=model.output)
-
+    # 使用特征提取模型获取特征
     X_train_features = feature_model.predict(X_train, batch_size=128)
     X_test_features = feature_model.predict(X_test, batch_size=128)
 
@@ -947,11 +1234,12 @@ def bayesian_optimization_cv(model_type, X, y, max_evals=150, n_splits=10):
 
 def train_models_with_best_params(X_train_features, y_train, weight):
     trained_models = {}
-
+    
+    print('\n🚀 开始训练传统分类器...')
     for model_type in ['SVM', 'RandomForest', 'DecisionTree']:
-        print(f"\n🔍 正在优化模型: {model_type}")
+        print(f'\n🔍 正在优化模型: {model_type}')
         best_params = bayesian_optimization_cv(model_type, X_train_features, y_train)
-        print(f"✅ 最佳参数 ({model_type}): {best_params}")
+        print(f'✅ 最佳参数 ({model_type}): {best_params}')
 
         model_class = {
             'SVM': SVC,
@@ -966,8 +1254,61 @@ def train_models_with_best_params(X_train_features, y_train, weight):
 
         # 可视化学习曲线
         plot_learning_curve(model, X_train_features, y_train, model_type)
-
-    return trained_models['SVM'], trained_models['RandomForest'], trained_models['DecisionTree']
+    
+    print('\n🚀 开始训练先进分类器...')
+    
+    # 初始化四种新分类器
+    advanced_models = {}
+    input_dim = X_train_features.shape[1]
+    
+    # 1. LightGBM
+    try:
+        if LIGHTGBM_AVAILABLE:
+            print('🔍 训练 LightGBM...')
+            lgb_model = LightGBMClassifier()
+            lgb_model.fit(X_train_features, y_train)
+            advanced_models['LightGBM'] = lgb_model
+            print('✅ LightGBM 训练成功')
+        else:
+            print('⚠️ LightGBM 不可用')
+    except Exception as e:
+        print(f'❌ LightGBM 训练失败: {e}')
+    
+    # 2. CatBoost
+    try:
+        if CATBOOST_AVAILABLE:
+            print('🔍 训练 CatBoost...')
+            cat_model = CatBoostClassifier()
+            cat_model.fit(X_train_features, y_train)
+            advanced_models['CatBoost'] = cat_model
+            print('✅ CatBoost 训练成功')
+        else:
+            print('⚠️ CatBoost 不可用')
+    except Exception as e:
+        print(f'❌ CatBoost 训练失败: {e}')
+    
+    # 3. Prototypical Network
+    try:
+        print('🔍 训练 Prototypical Network...')
+        proto_model = PrototypicalNetwork(input_dim=input_dim)
+        proto_model.fit(X_train_features, y_train, epochs=50)
+        advanced_models['Prototypical'] = proto_model
+        print('✅ Prototypical Network 训练成功')
+    except Exception as e:
+        print(f'❌ Prototypical Network 训练失败: {e}')
+    
+    # 合并所有模型
+    trained_models.update(advanced_models)
+    
+    print(f'\n🎉 训练完成！共训练了 {len(trained_models)} 个模型')
+    print(f'模型列表: {list(trained_models.keys())}')
+    
+    # 返回传统模型（保持原有接口）+ 新模型字典
+    svm_model = trained_models.get('SVM')
+    rf_model = trained_models.get('RandomForest') 
+    dt_model = trained_models.get('DecisionTree')
+    
+    return svm_model, rf_model, dt_model, advanced_models
 
 
 def plot_learning_curve(estimator, X, y, model_name):
@@ -1031,11 +1372,21 @@ def evaluate_model(model, X_train_features, y_train, X_test_features, y_test, mo
         y_train_prob = model.predict_proba(X_train_features)
         y_test_prob = model.predict_proba(X_test_features)
     else:
-        # Keras 模型（如 BoNet）
-        y_train_prob = model.predict(X_train_features)
-        y_test_prob = model.predict(X_test_features)
-        y_train_pred = np.argmax(y_train_prob, axis=1)
-        y_test_pred = np.argmax(y_test_prob, axis=1)
+        # 其他模型（如 BoNet, PrototypicalNetwork 等）
+        y_train_pred = model.predict(X_train_features)
+        y_test_pred = model.predict(X_test_features)
+        
+        # 检查预测结果是否为概率分布（2D数组）
+        if isinstance(y_train_pred, np.ndarray) and y_train_pred.ndim > 1:
+            # 如果是概率分布，提取类别预测
+            y_train_pred = np.argmax(y_train_pred, axis=1)
+            y_test_pred = np.argmax(y_test_pred, axis=1)
+            y_train_prob = y_train_pred  # 使用原始概率分布
+            y_test_prob = y_test_pred
+        else:
+            # 如果已经是类别索引（1D数组），无法计算AUC
+            y_train_prob = None
+            y_test_prob = None
 
     # === 计算指标 ===
     train_accuracy = accuracy_score(y_train, y_train_pred)
@@ -1091,7 +1442,7 @@ def evaluate_model(model, X_train_features, y_train, X_test_features, y_test, mo
 
     print("\n📋 分类报告:")
     try:
-        target_names = ["Normal", "DDwoR", "DDwR"]
+        target_names = ["Normal", "DDwR", "DDwoR"]
         print(classification_report(y_test, y_test_pred, target_names=target_names))
     except:
         print(classification_report(y_test, y_test_pred))
@@ -1157,63 +1508,143 @@ def summarize_results(results_dict):
 
 def plot_confusion_matrix_and_roc(models, model_names, X_test, y_test, Setname):
     from sklearn.metrics import confusion_matrix, roc_curve, auc
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+    import numpy as np
 
     # 定义类别标签
-    class_labels = ["Normal", "DDwoR", "DDwR"]
+    class_labels = ["Normal", "DDwR", "DDwoR"]
 
-    # 绘制混淆矩阵
-    plt.figure(figsize=(4 * len(models), 4))
-    for i, (model, name) in enumerate(zip(models, model_names)):
-        if hasattr(model, "predict"):
-            y_test_pred = model.predict(X_test)
-            if isinstance(y_test_pred, np.ndarray) and y_test_pred.ndim == 2:
-                # BoNet 情况
-                y_test_pred = np.argmax(y_test_pred, axis=1)
+    # 过滤有效的模型（有predict方法的模型）
+    valid_models = []
+    valid_names = ['SVM', 'Random Forest', 'Decision Tree', 'lightGBM', 'CatBoost', 'PrototypicalNet']
+    
+    for model, name in zip(models, model_names):
+        if hasattr(model, "predict") or hasattr(model, "forward"):
+            valid_models.append(model)
         else:
+            print(f"⚠️ 跳过模型 {name}: 没有predict方法")
+    
+    if not valid_models:
+        print("❌ 没有有效的模型可以绘制")
+        return
+    
+    # 计算需要的行数和列数（每行3个）
+    num_models = len(valid_models)
+    cols = 3
+    rows = (num_models + cols - 1) // cols  # 向上取整
+
+    # 绘制混淆矩阵 - 每行3个
+    plt.figure(figsize=(5 * cols, 4 * rows))
+    for i, (model, name) in enumerate(zip(valid_models, valid_names)):
+        try:
+            # 处理不同类型的模型预测
+            if hasattr(model, "predict"):
+                # sklearn模型
+                y_test_pred = model.predict(X_test)
+                if isinstance(y_test_pred, np.ndarray) and y_test_pred.ndim == 2:
+                    # BoNet 情况
+                    y_test_pred = np.argmax(y_test_pred, axis=1)
+            elif hasattr(model, "forward") and hasattr(model, "eval"):
+                # PyTorch模型
+                import torch
+                model.eval()
+                with torch.no_grad():
+                    if isinstance(X_test, np.ndarray):
+                        X_tensor = torch.FloatTensor(X_test)
+                    else:
+                        X_tensor = X_test
+                    outputs = model(X_tensor)
+                    y_test_pred = torch.argmax(outputs, dim=1).numpy()
+            else:
+                print(f"⚠️ 跳过模型 {name}: 无法进行预测")
+                continue
+
+            cm = confusion_matrix(y_test, y_test_pred)
+
+            plt.subplot(rows, cols, i + 1)
+            sns.heatmap(cm, annot=True, fmt="d", cmap='Blues', cbar=True,
+                        xticklabels=class_labels, yticklabels=class_labels)
+            plt.title(f"{name} Confusion Matrix", fontsize=12, fontweight='bold')
+            plt.xlabel("Predicted Label", fontsize=10)
+            plt.ylabel("True Label", fontsize=10)
+            
+            # 添加数值标注
+
+        except Exception as e:
+            print(f"⚠️ 模型 {name} 绘制失败: {e}")
             continue
 
-        cm = confusion_matrix(y_test, y_test_pred)
-
-        plt.subplot(1, len(models), i + 1)
-        sns.heatmap(cm, annot=True, fmt="d", cmap='Blues', cbar=False,
-                    xticklabels=class_labels, yticklabels=class_labels)
-        plt.title(f"{name} Confusion Matrix")
-        plt.xlabel("Predicted Label")
-        plt.ylabel("True Label")
-
     plt.tight_layout()
-    plt.savefig(f'Confusion_Matrix_{Setname}.png')
+    plt.savefig(f'Confusion_Matrix_{Setname}.png', dpi=300, bbox_inches='tight')
     plt.show()
 
-    # ROC曲线绘制
+    # ROC曲线绘制 - 改进布局
     y_test_binarized = label_binarize(y_test, classes=[0, 1, 2])
-    plt.figure(figsize=(8, 6))
-    for i, (model, name) in enumerate(zip(models, model_names)):
-        # BoNet 处理方式不同
-        if hasattr(model, 'predict_proba'):
-            y_score = model.predict_proba(X_test)
-        else:
-            y_pred_prob = model.predict(X_test)
-            if isinstance(y_pred_prob, np.ndarray) and y_pred_prob.ndim == 2:
-                y_score = y_pred_prob
-            else:
-                continue  # 非概率预测模型跳过
+    
+    # 为每个类别创建子图
+    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+    colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', '#8c564b', '#e377c2', '#7f7f7f']
+    
+    for class_idx in range(3):
+        ax = axes[class_idx]
+        
+        for i, (model, name) in enumerate(zip(valid_models, valid_names)):
+            try:
+                # 处理不同类型的模型
+                if hasattr(model, 'predict_proba'):  # sklearn模型
+                    y_score = model.predict_proba(X_test)
+                elif hasattr(model, 'forward') and hasattr(model, 'eval'):  # PyTorch模型
+                    import torch
+                    model.eval()
+                    with torch.no_grad():
+                        if isinstance(X_test, np.ndarray):
+                            X_tensor = torch.FloatTensor(X_test)
+                        else:
+                            X_tensor = X_test
+                        outputs = model(X_tensor)
+                        y_score = torch.softmax(outputs, dim=1).numpy()
+                else:
+                    y_pred_prob = model.predict(X_test)
+                    if isinstance(y_pred_prob, np.ndarray) and y_pred_prob.ndim == 2:
+                        y_score = y_pred_prob
+                    else:
+                        continue  # 非概率预测模型跳过
 
-        # 绘制每个类别的 ROC 曲线
-        for j in range(3):
-            fpr, tpr, _ = roc_curve(y_test_binarized[:, j], y_score[:, j])
-            roc_auc = auc(fpr, tpr)
-            plt.plot(fpr, tpr, label=f'{name} - {class_labels[j]} (AUC = {roc_auc:.2f})')
+                # 确保 y_score 是二维数组
+                if y_score.ndim == 1:
+                    # 如果是二分类，需要转换为二维
+                    y_score = np.column_stack([1-y_score, y_score])
 
-    plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
-    plt.xlim([0.0, 1.0])
-    plt.ylim([0.0, 1.05])
-    plt.xlabel('False Positive Rate')
-    plt.ylabel('True Positive Rate')
-    plt.title('ROC Curve for Each Class')
-    plt.legend(loc="lower right")
+                # 绘制当前类别的 ROC 曲线
+                fpr, tpr, _ = roc_curve(y_test_binarized[:, class_idx], y_score[:, class_idx])
+                roc_auc = auc(fpr, tpr)
+                
+                color = colors[i % len(colors)]
+                ax.plot(fpr, tpr, color=color, lw=2.5, 
+                       label=f'{name} (AUC = {roc_auc:.3f})')
+                
+            except Exception as e:
+                print(f"跳过模型 {name} 的ROC绘制: {e}")
+                continue
+
+        # 绘制对角线
+        ax.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--', alpha=0.8)
+        ax.set_xlim([0.0, 1.0])
+        ax.set_ylim([0.0, 1.05])
+        ax.set_xlabel('False Positive Rate', fontsize=12)
+        ax.set_ylabel('True Positive Rate', fontsize=12)
+        ax.set_title(f'ROC Curve - {class_labels[class_idx]}', fontsize=14, fontweight='bold')
+        ax.legend(loc="lower right", fontsize=10)
+        ax.grid(True, alpha=0.3)
+        
+        # 添加AUC文本
+        ax.text(0.6, 0.2, f'Class: {class_labels[class_idx]}', 
+               transform=ax.transAxes, fontsize=12, fontweight='bold',
+               bbox=dict(boxstyle='round,pad=0.3', facecolor='lightblue', alpha=0.7))
+
     plt.tight_layout()
-    plt.savefig(f'ROC_Curve_{Setname}.png')
+    plt.savefig(f'ROC_Curve_{Setname}.png', dpi=300, bbox_inches='tight')
     plt.show()
 
 
@@ -1259,6 +1690,10 @@ def visualize_tsne(original_data, lstm_data, labels, titles):
 
 
 def main():
+    # ============ 配置选项 ============
+    # 是否使用增强LSTM特征提取 (True: 使用增强LSTM, False: 使用原始LSTM)
+    USE_ENHANCED_LSTM = False
+    
     # ============ 读取数据并初步处理数据 ============
     loader = TrajectoryDataLoader(target_length=200, threshold=1.0)
 
@@ -1317,14 +1752,45 @@ def main():
     X_train = scaler.fit_transform(X_train.reshape(X_train.shape[0], -1)).reshape(X_train.shape)
     X_val = scaler.transform(X_val.reshape(X_val.shape[0], -1)).reshape(X_val.shape)
     X_test_scaler = scaler.transform(X_test.reshape(X_test.shape[0], -1)).reshape(X_test.shape)
-    X_train_features, X_test_features = extract_lstm_features(X_train, y_train, X_val, y_val, X_test_scaler,
-                                                              input_shape=None,
-                                                              save_path="best_model.h5",
-                                                              dense_units=32,  # ✅ 输出维度
-                                                              use_attention=True,  # ✅ 是否使用 Attention
-                                                              loss_type='mse',  # ✅ 损失函数类型
-                                                              return_scaler=False  # ✅ 是否返回 scaler
-                                                              )
+    # ============ 特征提取 ============
+    if USE_ENHANCED_LSTM:
+        print("🚀 使用增强LSTM进行特征提取...")
+        # 使用增强LSTM特征提取
+        extractor = EnhancedLSTMFeatureExtractor(
+            lstm_units=[128, 64],
+            attention_heads=16,
+            dense_units=128,
+            dropout_rate=0.5
+        )
+        
+        # 训练特征提取器
+        print("�� 训练增强LSTM特征提取器...")
+        history = extractor.train_feature_extractor(
+            X_train, y_train, X_val, y_val,
+            epochs=100,
+            batch_size=64,
+            save_path="enhanced_lstm_model.h5"
+        )
+        
+        # 提取特征
+        print("🔍 提取训练集和测试集特征...")
+        X_train_features, X_test_features = extractor.extract_features_with_scaling(X_train, X_test)
+        
+        print(f"✅ 增强LSTM特征提取完成!")
+        print(f"训练集特征形状: {X_train_features.shape}")
+        print(f"测试集特征形状: {X_test_features.shape}")
+    else:
+        print("🔍 使用原始LSTM进行特征提取...")
+        X_train_features, X_test_features = extract_lstm_features(X_train, y_train, X_val, y_val, X_test_scaler,
+                                                                  input_shape=None,
+                                                                  save_path="best_model.h5",
+                                                                  dense_units=32,  # ✅ 输出维度
+                                                                  use_attention=True,  # ✅ 是否使用 Attention
+                                                                  loss_type="sparse_categorical_crossentropy",
+                                                                  # ✅ 损失函数类型
+                                                                  return_scaler=False,  # ✅ 是否返回 scaler
+                                                                  use_advanced_attention=True  # ✅ 启用增强注意力机制
+                                                                  )
 
     print("训练集在经过LSTM提取时序信息后大小：")
     print(X_train_features.shape)
@@ -1342,7 +1808,7 @@ def main():
 
     weight = {0: 1, 1: 1, 2: 1}
     # 贝叶斯参数优化
-    # svm_model, rf_model, dt_model = train_models_with_best_params(X_train_features, y_train, weight)
+    # svm_model, rf_model, dt_model, advanced_models = train_models_with_best_params(X_train_features, y_train, weight)
 
     # ================ 模型构建阶段 ===============
     svm_model = SVC(C=2, kernel='rbf', class_weight=weight, probability=True, random_state=42)
@@ -1402,21 +1868,103 @@ def main():
     result_svm = evaluate_model(svm_model, X_train_features, y_train, X_test_features, y_test, 'SVM', file_info)
     result_rf = evaluate_model(rf_model, X_train_features, y_train, X_test_features, y_test, 'RandomForest', file_info)
     result_dt = evaluate_model(dt_model, X_train_features, y_train, X_test_features, y_test, 'DecisionTree', file_info)
-
+    
+    # 初始化结果字典
     results_dict = {
         'SVM': result_svm,
         'RandomForest': result_rf,
         'DecisionTree': result_dt,
     }
+    # ================= 先进分类器测试阶段 ===============
+    print('\n' + '=' * 60)
+    print('🚀 开始测试最新先进分类器...')
+    print('=' * 60)
+    
+    # 准备数据（展平为2D特征）
+    X_train_flat = X_train_features
+    X_test_flat = X_test_features
+    
+    # 测试先进分类器
+    print(f'输入数据形状: X_train_flat: {X_train_flat.shape}, X_test_flat: {X_test_flat.shape}')
+    print(f'标签形状: y_train: {y_train.shape}, y_test: {y_test.shape}')
+    
+    try:
+        # 初始化四种新分类器
+        advanced_models = {}
+        input_dim = X_train_flat.shape[1]
+
+        # 1. LightGBM
+        try:
+            if LIGHTGBM_AVAILABLE:
+                print('🔍 训练 LightGBM...')
+                lgb_model = LightGBMClassifier()
+                lgb_model.fit(X_train_flat, y_train)
+                advanced_models['LightGBM'] = lgb_model
+                print('✅ LightGBM 训练成功')
+            else:
+                print('⚠️ LightGBM 不可用')
+        except Exception as e:
+            print(f'❌ LightGBM 训练失败: {e}')
+
+        # 2. CatBoost
+        try:
+            if CATBOOST_AVAILABLE:
+                print('🔍 训练 CatBoost...')
+                cat_model = CatBoostClassifier()
+                cat_model.fit(X_train_flat, y_train)
+                advanced_models['CatBoost'] = cat_model
+                print('✅ CatBoost 训练成功')
+            else:
+                print('⚠️ CatBoost 不可用')
+        except Exception as e:
+            print(f'❌ CatBoost 训练失败: {e}')
+
+        # 3. Prototypical Network
+        try:
+            print('🔍 训练 Prototypical Network...')
+            proto_model = PrototypicalNetwork(input_dim=input_dim)
+            proto_model.fit(X_train_flat, y_train, epochs=50)
+            advanced_models['PrototypicalNet'] = proto_model
+            print('✅ Prototypical Network 训练成功')
+        except Exception as e:
+            print(f'❌ Prototypical Network 训练失败: {e}')
+
+        # 将先进分类器结果添加到结果字典
+        advanced_model_names = ['LightGBM', 'CatBoost', 'PrototypicalNet']
+
+        for name in advanced_model_names:
+            if name in advanced_models:
+                model = advanced_models[name]
+
+                # 使用evaluate_model函数评估模型
+                result = evaluate_model(model, X_train_flat, y_train, X_test_flat, y_test, name,
+                                        file_info)
+
+                # 添加到结果字典
+                results_dict[name] = result
+
+        print(f'\n✅ 先进分类器测试完成！')
+        
+    except Exception as e:
+        print(f'⚠️ 先进分类器测试失败: {e}')
+        print('继续使用传统分类器...')
+        # 确保 results_dict 仍然可用
 
     summary_df = summarize_results(results_dict)
     summary_df.to_csv("model_summary.csv", index=False)
 
+    # 准备所有模型用于绘图
     models = [svm_model, rf_model, dt_model]
     model_names = ['SVM', 'RandomForest', 'DecisionTree']
+    
+    # 添加先进分类器到绘图列表
+    if 'advanced_models' in locals() and advanced_models:
+        models.extend(advanced_models.values())
+        model_names.extend(advanced_model_names)
+        print(f'\n📊 将绘制 {len(models)} 个模型的混淆矩阵和ROC曲线')
+        print(f'模型列表: {model_names}')
+    
     # 绘制混淆矩阵和ROC
-    # plot_confusion_matrix_and_roc(models, model_names, X_train_features, y_train, 'Train Set')
-    # plot_confusion_matrix_and_roc(models, model_names, X_test_features, y_test, 'Test Set')
     plot_confusion_matrix_and_roc(models, model_names, X_train_features, y_train, 'Train Set')
     plot_confusion_matrix_and_roc(models, model_names, X_test_features, y_test, 'Test Set')
 
@@ -1452,14 +2000,33 @@ def main():
         print(f"Phase {i + 1} has {len(phase_data)} samples")
 
     # 计算并绘制 SHAP 值
-    shap_values_list = plot_phase_shap_importance([svm_model, rf_model, dt_model],
-                                                  ['SVM', 'RandomForest', 'DecisionTree'],
-                                                  X_train, y_train, X_test, phases_feature_indices)
+    # shap_values_list = plot_phase_shap_importance([svm_model, rf_model, dt_model],
+    #                                               ['SVM', 'RandomForest', 'DecisionTree'],
+    #                                               X_train, y_train, X_test, phases_feature_indices)
+    #
+    # # 绘制阶段聚合特征重要性图
+    # phases_name = [f'Phase {i + 1}' for i in range(6)]
+    # plot_phase_aggregated_feature_importance(shap_values_list,
+    #                                          phase_names=phases_name)
 
-    # 绘制阶段聚合特征重要性图
-    phases_name = [f'Phase {i + 1}' for i in range(6)]
-    plot_phase_aggregated_feature_importance(shap_values_list,
-                                             phase_names=phases_name)
+    # 综合阶段可解释性分析
+    print('\n' + '=' * 60)
+    print('🚀 开始综合阶段可解释性分析')
+    print('=' * 60)
+    
+    # 准备轨迹数据（使用原始轨迹数据）
+    trajectories = X  # 使用已加载的轨迹数据
+    labels = y  # 使用已加载的标签数据
+    
+    # 调用综合阶段分析
+    phase_analysis_results = comprehensive_phase_analysis(
+        trajectories=trajectories,
+        labels=labels,
+        models=[svm_model, rf_model, dt_model],
+        model_names=['SVM', 'RandomForest', 'DecisionTree'],
+        num_phases=6,
+        save_path='results/plots'
+    )
 
 
 if __name__ == '__main__':
