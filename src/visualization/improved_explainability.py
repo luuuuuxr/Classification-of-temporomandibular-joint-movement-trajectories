@@ -2,6 +2,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
+import os
 from sklearn.preprocessing import StandardScaler
 
 
@@ -20,9 +21,7 @@ def comprehensive_phase_analysis(trajectories, labels, models, model_names,
     """
     print("🚀 开始综合阶段可解释性分析...")
 
-    # 由于模型是用LSTM提取的32维特征训练的，我们需要使用相同的特征提取方法
     n_samples = len(trajectories)
-    n_features = 32  # LSTM提取的特征维度
     
     print(f"轨迹数据形状: {trajectories.shape}")
     print(f"标签数据形状: {labels.shape}")
@@ -37,9 +36,10 @@ def comprehensive_phase_analysis(trajectories, labels, models, model_names,
             print(f"模型 {name} 没有 predict 方法，跳过")
             continue
 
-        # 创建模拟的32维特征（实际应用中应该使用相同的LSTM特征提取方法）
-        X_phase = np.random.rand(n_samples, n_features)
-        print(f"模拟特征形状: {X_phase.shape}")
+        # 处理轨迹数据：将3D轨迹数据(样本数, 时间步, 3)展平为2D特征(样本数, 时间步*3)
+        X_phase = trajectories.reshape(n_samples, -1)
+        print(f"展平后特征形状: {X_phase.shape}")
+        n_features = X_phase.shape[1]
 
         # 标准化特征
         scaler = StandardScaler()
@@ -51,19 +51,26 @@ def comprehensive_phase_analysis(trajectories, labels, models, model_names,
             accuracy = np.mean(y_pred_class == labels)
             print(f"模拟特征准确率: {accuracy:.4f}")
 
-            # 分析每个阶段的重要性（模拟）
+            # 分析每个阶段的重要性
             phase_importance = {}
-            features_per_phase = n_features // num_phases
+            
+            # 假设轨迹数据时间步为200，将时间维度分成6个阶段
+            time_steps = trajectories.shape[1]
+            phases_time = np.array_split(np.arange(time_steps), num_phases)
+            
+            # 计算每个阶段对应的特征索引（每个时间步有3个特征维度）
+            phases_feature_indices = [
+                [i for t in phase for i in (3 * t, 3 * t + 1, 3 * t + 2)]
+                for phase in phases_time
+            ]
             
             for phase_idx in range(num_phases):
-                start_idx = phase_idx * features_per_phase
-                end_idx = (phase_idx + 1) * features_per_phase
-                phase_features = X_phase_scaled[:, start_idx:end_idx]
+                phase_features = X_phase_scaled[:, phases_feature_indices[phase_idx]]
                 feature_variance = np.var(phase_features, axis=0)
                 phase_importance[f"Phase_{phase_idx + 1}"] = {
                     "mean_variance": np.mean(feature_variance),
                     "max_variance": np.max(feature_variance),
-                    "feature_count": features_per_phase
+                    "feature_count": len(phases_feature_indices[phase_idx])
                 }
 
             results[name] = {
@@ -150,6 +157,8 @@ def plot_phase_importance_comparison(results, num_phases, save_path):
     axes[1, 1].tick_params(axis="x", rotation=45)
 
     plt.tight_layout()
+    # 创建保存目录
+    os.makedirs(save_path, exist_ok=True)
     plt.savefig(f"{save_path}/phase_importance_analysis.png", dpi=300, bbox_inches="tight")
     plt.show()
 

@@ -8,7 +8,7 @@ from scipy.interpolate import interp1d
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import train_test_split
 from imblearn.over_sampling import SMOTE
-from utils import print_data_info, validate_data
+from src.utils.utils import print_data_info, validate_data
 
 class TrajectoryDataLoader:
     """轨迹数据加载器"""
